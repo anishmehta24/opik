@@ -8,6 +8,7 @@ Serialisation here is for the wire only. Content hashes are computed elsewhere, 
 standard library, so item identity never depends on which serialiser is in use.
 """
 
+import asyncio
 import dataclasses
 import datetime
 import decimal
@@ -15,14 +16,16 @@ import enum
 import json
 import logging
 import pathlib
+import threading
 import uuid
 import zlib
 from concurrent import futures
-from typing import Any, Callable, Dict, Mapping, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Set
 
+import httpx
 import pydantic
 
-from ... import config
+from ... import httpx_client
 from .. import constants
 from . import identifiers
 from ...rest_api.core.jsonable_encoder import jsonable_encoder
@@ -162,7 +165,11 @@ class StreamingBatchWriter:
             else zlib.compressobj(self._gzip_level, zlib.DEFLATED, _GZIP_WBITS)
         )
         self._chunks = [self._encode(self._prefix)]
-        self._logical_bytes = 0
+        # Seeded with the envelope, not zero: the cap bounds the request the backend
+        # receives, and a reverse proxy in front of a self-hosted install measures the
+        # whole body. Counting only the items lets a batch land over the limit by the
+        # envelope's width.
+        self._logical_bytes = len(self._prefix) + len(self._suffix)
         self._items = 0
 
     def _encode(self, data: bytes) -> bytes:
@@ -225,43 +232,124 @@ class StreamingBatchWriter:
         self._flush_callback(body, item_count)
 
 
+# Given a body and the pool's client: build the request, send it, retry it, and raise
+# what retrying could not fix. Leaves URL, headers and retry policy with the caller, the
+# same division the thread-backed pool had.
+AsyncSend = Callable[[bytes, httpx.AsyncClient], Awaitable[None]]
+
+
+@dataclasses.dataclass
+class _Running:
+    """The loop, its thread and the client: started together, torn down together.
+
+    One optional field rather than three, so "has the pool started" is a single question
+    and no half-started combination can be represented.
+    """
+
+    loop: asyncio.AbstractEventLoop
+    thread: threading.Thread
+    client: httpx.AsyncClient
+
+
 class BoundedSendPool:
-    """Send finished bodies, with only so many outstanding at once.
+    """Send finished bodies over asyncio, with only so many outstanding at once.
 
     The bound is the point: without it a producer that serialises faster than the network
     drains would turn "never materialise the upload" back into "materialise it as queued
-    request bodies". `submit` blocks once `num_threads * 2` bodies are outstanding.
+    request bodies". `submit` blocks once `num_threads * 2` bodies are outstanding, and
+    waits there on a plain `concurrent.futures.Future` per body, so the producing thread
+    never touches asyncio itself. `num_threads * 2` requests may be in flight at once --
+    it sizes the bound, not a pool of threads; every send runs as a coroutine on one
+    background event loop.
 
-    `ThreadPoolExecutor` grows a worker per submitted body up to `num_threads`, so a small
-    upload never starts the full ceiling; a single worker sends inline and starts no thread
-    at all. The first failure is re-raised to the producer. There is no rollback, so bodies
-    already accepted stay persisted.
+    A single worker takes none of that: it sends inline through `inline_send`, starting
+    no loop, no thread and no client, which is what a backend older than
+    `MIN_BACKEND_VERSION_FOR_PARALLEL_INSERT` needs. So does an upload whose client sends
+    through a transport an async client cannot use: rather than send around whatever that
+    transport enforces, the pool falls back to the same inline path.
+
+    Neither does an upload that turns out to be one request, whatever the worker count.
+    The first body is held rather than sent, and goes inline at `close` if no second body
+    follows -- so `insert` of a handful of items pays for no loop, no thread and no second
+    connection pool, and a caller inserting in a loop keeps the sync client's keepalive
+    rather than opening a connection per call. A second body starts the loop and both go
+    through it, in order.
+
+    The first failure is re-raised to the producer, from `submit` or `close`. There is no
+    rollback, so bodies already accepted stay persisted.
     """
 
     def __init__(
         self,
         *,
-        send: Callable[[bytes], None],
+        send: AsyncSend,
+        inline_send: Callable[[bytes], None],
         num_threads: int,
+        transport: httpx.Client,
         max_pending: int,
     ) -> None:
         self._send = send
+        self._inline_send = inline_send
+        self._single_worker = num_threads == 1
+        self._transport = transport
         self._max_pending = max_pending
+        # Touched only by the producing thread, so it needs no lock of its own.
         self._pending: Set["futures.Future[None]"] = set()
-        self._pool: Optional[futures.ThreadPoolExecutor] = (
-            futures.ThreadPoolExecutor(max_workers=num_threads)
-            if num_threads > 1
-            else None
+
+        # Nothing is started here: an insert that never produces a second body must not
+        # cost a loop, and a constructor that starts one leaks it if the caller's next
+        # line raises before the try that closes this.
+        self._held: Optional[bytes] = None
+        self._running: Optional[_Running] = None
+
+    def _start(self) -> "_Running":
+        """Open the loop, its thread and the client, or leave nothing behind trying.
+
+        The thread is what fails here in practice -- this path exists to avoid threads, so
+        a process short of them is exactly where it runs -- and an unclosed loop is a
+        leaked selector descriptor, one per insert for a caller inserting in a loop.
+        """
+        # Built from the client the sync path sends through, so the upload keeps the same
+        # identity, base URL, timeouts and TLS settings. Raises rather than returning a
+        # client that would send around the caller's transport.
+        client = httpx_client.async_twin(
+            self._transport, max_connections=self._max_pending
         )
+        loop = None
+        try:
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(
+                target=loop.run_forever,
+                name="opik-dataset-send-pool",
+                daemon=True,
+            )
+            thread.start()
+        except BaseException:
+            if loop is not None:
+                loop.close()
+            # The client is dropped rather than closed: `aclose` is a coroutine and no loop
+            # is left to run it on. It never sent a request, so it holds no connection.
+            raise
 
-    def submit(self, body: bytes, item_count: int) -> None:
-        LOGGER.debug("Sending dataset items batch of size %d", item_count)
-        if self._pool is None:
-            self._send(body)
-            return
+        return _Running(loop=loop, thread=thread, client=client)
 
-        # Waiting here is the back-pressure: the producer cannot run ahead of the network
-        # by more than the bodies this set holds.
+    async def _guarded_send(
+        self, body: bytes, client: httpx.AsyncClient, sent: "futures.Future[None]"
+    ) -> None:
+        # Every outcome is put on the future here rather than left to the one
+        # `run_coroutine_threadsafe` returns: a `BaseException` out of a task takes the
+        # loop down with it, and the future it would have resolved never resolves, so a
+        # producer waiting at the bound would wait forever.
+        try:
+            await self._send(body, client)
+        except BaseException as exception:
+            sent.set_exception(exception)
+        else:
+            sent.set_result(None)
+
+    def _enqueue(self, body: bytes, running: "_Running") -> None:
+        # Waiting here is the back-pressure, and the only bound there is: the producer
+        # cannot run ahead of the network by more than the bodies this set holds.
         if len(self._pending) >= self._max_pending:
             done, self._pending = futures.wait(
                 self._pending, return_when=futures.FIRST_COMPLETED
@@ -269,16 +357,110 @@ class BoundedSendPool:
             for future in done:
                 future.result()
 
-        self._pending.add(self._pool.submit(self._send, body))
+        sent: "futures.Future[None]" = futures.Future()
+        # Tracked only once the loop has accepted it: a future recorded before a failed
+        # `run_coroutine_threadsafe` -- a submit after close, against a loop already shut --
+        # is one nothing will ever resolve, and every later wait would block on it forever.
+        asyncio.run_coroutine_threadsafe(
+            self._guarded_send(body, running.client, sent), running.loop
+        )
+        self._pending.add(sent)
+
+    def _hold(self, body: bytes) -> None:
+        """Keep the first body back, in case it is the only one."""
+        self._held = body
+
+    def _promote_held(self, held: bytes) -> Optional["_Running"]:
+        """Second body: the upload is worth a loop after all, so start and send the first.
+
+        Returns the started state, or None when the caller's transport carries policy an
+        async client cannot use -- in which case the upload stays on the sync client,
+        which is slower and the only option that does not send around that policy.
+
+        The held body is released only once its destination is settled. Clearing it first
+        would drop it if `_start` raised, and there is nowhere left to send it from by then.
+        """
+        try:
+            running = self._start()
+        except httpx_client.AsyncTransportUnavailable as exception:
+            LOGGER.warning(
+                "Uploading dataset items sequentially: %s, so the parallel upload would "
+                "have had to send around it. Other requests are unaffected.",
+                exception,
+            )
+            self._single_worker = True
+            self._held = None
+            self._inline_send(held)
+            return None
+
+        self._running, self._held = running, None
+        self._enqueue(held, running)
+        return running
+
+    def submit(self, body: bytes, item_count: int) -> None:
+        LOGGER.debug("Sending dataset items batch of size %d", item_count)
+        if self._single_worker:
+            self._inline_send(body)
+            return
+
+        running = self._running
+        if running is None:
+            held = self._held
+            if held is None:
+                self._hold(body)
+                return
+            running = self._promote_held(held)
+            if running is None:
+                self._inline_send(body)
+                return
+
+        self._enqueue(body, running)
 
     def close(self) -> None:
-        if self._pool is None:
+        """Finish the upload: flush a body still held, then drain and tear down."""
+        if self._held is not None:
+            # The whole upload was one body, so it never needed a loop. Sent here rather
+            # than at `submit` because only now is it known that no second body follows.
+            held, self._held = self._held, None
+            self._inline_send(held)
+
+        if self._running is None:
             return
         try:
             for future in futures.as_completed(self._pending):
                 future.result()
         finally:
-            self._pool.shutdown(wait=True)
+            self._shutdown()
+
+    def abort(self) -> None:
+        """Tear down without finishing the upload, for a producer that is already failing.
+
+        The held body is dropped rather than sent: `close` would start a fresh blocking
+        request, with its retries and rate-limit waits, while an exception unwinds -- so a
+        serialisation failure half way through, or a Ctrl-C, would begin an upload instead
+        of ending one. Sends already in flight are still drained; abandoning them
+        mid-request is not ours to do.
+        """
+        self._held = None
+        self._shutdown()
+
+    def _shutdown(self) -> None:
+        """Stop the loop, its thread and the client. Safe to call more than once."""
+        running = self._running
+        if running is None or running.loop.is_closed():
+            return
+
+        # A first failure leaves the rest of the sends running; stopping the loop under
+        # them would abandon them mid-request.
+        futures.wait(self._pending)
+        try:
+            asyncio.run_coroutine_threadsafe(
+                running.client.aclose(), running.loop
+            ).result()
+        finally:
+            running.loop.call_soon_threadsafe(running.loop.stop)
+            running.thread.join()
+            running.loop.close()
 
 
 def item_payload(
@@ -338,20 +520,35 @@ def build_batch_writer(
             "batch_group_id": batch_group_id,
         },
         flush_callback=flush_callback,
-        max_payload_bytes=int(config.MAX_BATCH_SIZE_MB * 1024 * 1024),
+        max_payload_bytes=int(constants.DATASET_ITEMS_MAX_BATCH_SIZE_MB * 1024 * 1024),
         max_items=constants.DATASET_ITEMS_MAX_BATCH_SIZE,
         gzip_level=gzip_level,
     )
 
 
-def build_send_pool(send: Callable[[bytes], None], num_threads: int) -> BoundedSendPool:
+def build_send_pool(
+    send: AsyncSend,
+    inline_send: Callable[[bytes], None],
+    num_threads: int,
+    transport: httpx.Client,
+) -> BoundedSendPool:
     """The upload sink for one insert.
 
-    Owns the one derivation the pool used to make for itself: twice the worker count,
-    so a worker that finishes has a body waiting without the producer running arbitrarily
-    far ahead. Passing it in explicitly keeps the pool free of a default that decided
-    policy where it could not be seen.
+    Owns the one derivation the pool used to make for itself: twice the worker count, so
+    a send that finishes has a body waiting without the producer running arbitrarily far
+    ahead. Passing it in explicitly keeps the pool free of a default that decided policy
+    where it could not be seen. It bounds requests in flight rather than threads: the
+    sends are coroutines on one loop, and the same number also sizes the upload client's
+    connection pool.
+
+    Both senders go in. The pool sends concurrently over an async client it builds from
+    `transport`, and inline through `inline_send` when there is a single worker or when
+    the whole upload turns out to be one body.
     """
     return BoundedSendPool(
-        send=send, num_threads=num_threads, max_pending=num_threads * 2
+        send=send,
+        inline_send=inline_send,
+        num_threads=num_threads,
+        transport=transport,
+        max_pending=num_threads * 2,
     )

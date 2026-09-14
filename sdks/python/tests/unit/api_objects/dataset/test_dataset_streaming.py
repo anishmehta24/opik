@@ -5,13 +5,14 @@ import datetime
 import json
 import tracemalloc
 import uuid
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+import httpx
 import pytest
 import tenacity
 
-import opik.config as config
 from opik import exceptions
+from opik.api_objects import constants
 from opik.api_objects.dataset import converters, streaming_writer
 from opik.api_objects.dataset.dataset import Dataset
 from opik.rest_api.core.jsonable_encoder import jsonable_encoder
@@ -128,14 +129,12 @@ def test_insert__generator__consumed_lazily_not_drained_up_front():
             yield item
 
     # One item per request, so progress through the source is observable.
-    import opik.config as config
-
-    original = config.MAX_BATCH_SIZE_MB
-    config.MAX_BATCH_SIZE_MB = 1e-9
+    original = constants.DATASET_ITEMS_MAX_BATCH_SIZE_MB
+    constants.DATASET_ITEMS_MAX_BATCH_SIZE_MB = 1e-9
     try:
         dataset.insert(source())
     finally:
-        config.MAX_BATCH_SIZE_MB = original
+        constants.DATASET_ITEMS_MAX_BATCH_SIZE_MB = original
 
     assert capture.request_count == 6, "Each item should have been its own request"
     assert len(drawn) == 6
@@ -340,7 +339,7 @@ def test_insert__streaming__uses_the_dataset_upload_compression_level(monkeypatc
 def test_insert__compression_disabled_on_the_client__plain_body_and_no_gzip_header():
     """`enable_json_request_compression=False` must reach the streaming path too."""
     capture = UploadCapture()
-    capture.compress_json_requests = False  # what the httpx client is built with
+    capture.client.compress_json_requests = False  # what the client is built with
     dataset = make_dataset(Dataset, Mock(), capture)
 
     dataset.insert(_items(2))
@@ -395,7 +394,8 @@ def test_insert__parallel_upload__a_failing_request_raises_to_the_caller(
     monkeypatch, instant_retries
 ):
     """A failure on a worker thread must reach the caller, not be lost in the pool."""
-    monkeypatch.setattr(config, "MAX_BATCH_SIZE_MB", 1e-9)  # one item per request
+    # one item per request
+    monkeypatch.setattr(constants, "DATASET_ITEMS_MAX_BATCH_SIZE_MB", 1e-9)
     capture = UploadCapture(status_code=500)
     mock_rest_client = Mock()
     mock_rest_client.version.return_value = {"version": "99.0.0"}  # allow parallelism
@@ -418,7 +418,8 @@ def test_insert__invalid_item__items_sent_before_it_stay_persisted(
     cannot be serialised is now found when it is reached, whatever the input was, and the
     requests already sent stay sent. `insert`'s docstring says exactly this.
     """
-    monkeypatch.setattr(config, "MAX_BATCH_SIZE_MB", 1e-9)  # one item per request
+    # one item per request
+    monkeypatch.setattr(constants, "DATASET_ITEMS_MAX_BATCH_SIZE_MB", 1e-9)
     capture = UploadCapture()
     dataset = make_dataset(Dataset, Mock(), capture)
 
@@ -449,7 +450,10 @@ def _payloads_with_an_oversized_item():
 
 def test_insert__oversized_item__gets_its_own_request_in_input_order(monkeypatch):
     """An item past the cap is sent alone, and the input's order survives batching."""
-    monkeypatch.setattr(config, "MAX_BATCH_SIZE_MB", 0.0005)
+    # ~840 bytes: room for the envelope plus both small rows, and nowhere near the
+    # oversized one. The cap counts the envelope, so a value tuned to the rows alone
+    # would split the two small items apart and stop this testing batching at all.
+    monkeypatch.setattr(constants, "DATASET_ITEMS_MAX_BATCH_SIZE_MB", 0.0008)
 
     capture = UploadCapture()
     streaming = make_dataset(Dataset, Mock(), capture)
@@ -590,7 +594,8 @@ def test_insert__producer_error_with_a_worker_error_pending__producer_error_wins
     monkeypatch,
 ):
     """Closing the pool must not replace the exception that explains the failure."""
-    monkeypatch.setattr(config, "MAX_BATCH_SIZE_MB", 1e-9)  # one item per request
+    # one item per request
+    monkeypatch.setattr(constants, "DATASET_ITEMS_MAX_BATCH_SIZE_MB", 1e-9)
     mock_rest_client = Mock()
     mock_rest_client.version.return_value = {"version": "99.0.0"}  # allow parallelism
 
@@ -623,7 +628,7 @@ def test_insert__standalone_rest_client__sends_its_auth_and_workspace_headers():
     )
     # The transport this Dataset resolves, with the wrapper's credentials left where the
     # generated client keeps them.
-    rest_client._client_wrapper.httpx_client.httpx_client = capture
+    rest_client._client_wrapper.httpx_client.httpx_client = capture.client
     dataset = Dataset(
         name="test_dataset",
         description="Test description",
@@ -661,7 +666,7 @@ def test_insert__standalone_rest_client__honours_the_configured_compression(
     monkeypatch.setenv("OPIK_ENABLE_JSON_REQUEST_COMPRESSION", "false")
     capture = UploadCapture()
     rest_client = OpikApi(base_url=capture.base_url, api_key="k", workspace_name="w")
-    rest_client._client_wrapper.httpx_client.httpx_client = capture
+    rest_client._client_wrapper.httpx_client.httpx_client = capture.client
     dataset = Dataset(
         name="test_dataset",
         description="Test description",
@@ -703,7 +708,8 @@ def test_insert__source_raises_part_way__error_propagates_and_earlier_items_are_
     `insert` documents that a generator's failure leaves earlier items persisted, and the
     cached count is invalidated in a `finally` for exactly this case.
     """
-    monkeypatch.setattr(config, "MAX_BATCH_SIZE_MB", 1e-9)  # one item per request
+    # one item per request
+    monkeypatch.setattr(constants, "DATASET_ITEMS_MAX_BATCH_SIZE_MB", 1e-9)
     capture = UploadCapture()
     dataset = make_dataset(Dataset, Mock(), capture, dataset_items_count=7)
     assert dataset.dataset_items_count == 7
@@ -719,3 +725,92 @@ def test_insert__source_raises_part_way__error_propagates_and_earlier_items_are_
     assert dataset._dataset_items_count is None, (
         "A partial insert leaves a cached count that no longer describes the dataset"
     )
+
+
+def test_insert__writer_construction_fails__still_closes_the_pool(monkeypatch):
+    """From its first send the pool owns an event loop, a thread and an httpx client, so
+    anything raising between opening it and the try that closes it leaks all three -- once
+    per call for a caller inserting in a loop."""
+    capture = UploadCapture()
+    dataset = make_dataset(Dataset, Mock(), capture)
+
+    torn_down = []
+    original_open = Dataset._open_send_pool
+
+    def spy_open(self, num_threads):
+        pool = original_open(self, num_threads)
+
+        for name in ("close", "abort"):
+            original = getattr(pool, name)
+
+            def tear_down(_original=original, _name=name):
+                torn_down.append(_name)
+                _original()
+
+            setattr(pool, name, tear_down)
+        return pool
+
+    monkeypatch.setattr(Dataset, "_open_send_pool", spy_open)
+    monkeypatch.setattr(
+        streaming_writer,
+        "StreamingBatchWriter",
+        Mock(side_effect=RuntimeError("writer refused to build")),
+    )
+
+    with pytest.raises(RuntimeError, match="writer refused to build"):
+        dataset.insert(_items(3))
+
+    assert torn_down == ["abort"], (
+        "the pool was left open when the writer failed to build"
+    )
+
+
+def test_insert__twice__does_not_close_the_caller_s_transport():
+    """The upload's client borrows the sync client's transport; `AsyncClient.aclose()`
+    closes the transport it was given. Closing it would end the connection pool the
+    caller's long-lived client still sends through, and the next insert would fail on a
+    client that still looks healthy."""
+
+    class RecordingTransport(httpx.MockTransport):
+        def __init__(self, handler):
+            super().__init__(handler)
+            self.closes = 0
+
+        def close(self) -> None:
+            self.closes += 1
+
+        async def aclose(self) -> None:
+            self.closes += 1
+
+    capture = UploadCapture()
+    transport = RecordingTransport(capture.handle)
+    capture.client = httpx.Client(transport=transport, base_url=capture.base_url)
+    rest_client = Mock()
+    rest_client.version.return_value = {"version": "99.0.0"}  # allow parallelism
+    dataset = make_dataset(Dataset, rest_client, capture)
+
+    # Two batches per insert, so both take the pooled path that builds and closes a client.
+    with patch("opik.api_objects.constants.DATASET_ITEMS_MAX_BATCH_SIZE", 1):
+        dataset.insert(_items(2), num_threads=2)
+        assert transport.closes == 0, "the caller's transport was closed by the upload"
+        dataset.insert(_items(2, prefix="second"), num_threads=2)
+
+    assert transport.closes == 0
+    assert capture.request_count == 4, "the second insert did not send"
+
+
+def test_insert__producer_fails__does_not_send_the_held_body():
+    """`close` flushes a body held back for a one-request upload; the abort path must not.
+    Issuing a fresh blocking PUT, with its retries and rate-limit waits, while an exception
+    unwinds turns a failed insert into one that starts an upload on its way out."""
+    capture = UploadCapture()
+    dataset = make_dataset(Dataset, Mock(), capture)
+
+    def failing_items():
+        yield {"input": {"k": 1}}
+        raise RuntimeError("the source gave up")
+
+    with pytest.raises(RuntimeError, match="the source gave up"):
+        dataset.insert(failing_items(), num_threads=2)
+
+    assert capture.request_count == 0, "the held body was uploaded while unwinding"
